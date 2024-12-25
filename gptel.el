@@ -1238,13 +1238,17 @@ file."
               gptel--old-header-line nil)
       (setq mode-line-process nil))))
 
+(defvar gptel--fsm-last)                ;Defined further below
 (defun gptel--update-status (&optional msg face)
   "Update status MSG in FACE."
   (when gptel-mode
     (if gptel-use-header-line
         (and (consp header-line-format)
-           (setf (nth 1 header-line-format)
-                 (propertize msg 'face face)))
+             (setf (nth 1 header-line-format)
+                   (thread-first
+                     msg
+                     (buttonize (lambda (_) (gptel--fsm-inspect)))
+                     (propertize 'face face 'mouse-face 'highlight))))
       (if (member msg '(" Typing..." " Waiting..."))
           (setq mode-line-process (propertize msg 'face face))
         (setq mode-line-process
@@ -1423,9 +1427,9 @@ considered a success and acts as a default.")
 (defvar gptel-request--handlers
   `((WAIT ,#'gptel--handle-wait)
     (TYPE ,#'gptel--handle-pre-insert)
-    (ERRS ,#'gptel--handle-error)
+    (ERRS ,#'gptel--handle-error ,#'gptel--fsm-last)
     (TOOL ,#'gptel--handle-tool-use)
-    (DONE ,#'gptel--handle-post-insert))
+    (DONE ,#'gptel--handle-post-insert ,#'gptel--fsm-last))
   "Alist specifying handlers for gptel's default state transitions.
 
 Each entry is a list whose car is a request state (a symbol) and
@@ -1494,6 +1498,75 @@ MACHINE is an instance of `gptel-fsm'"
      for (pred . next) in transitions
      when (or (eq pred t) (funcall pred info))
      return next)))
+
+(defvar-local gptel--fsm-last nil
+  "State machine for latest request in the buffer.")
+
+(defun gptel--fsm-last (fsm)
+    "Capture the latest request state FSM for introspection."
+    (let ((info (gptel-fsm-info fsm)))
+      (unless gptel-log-level
+        (let ((data (plist-get info :data)))
+          (dolist (key '(:messages :contents :query))
+            (setf (plist-get data key) nil))))
+      (setf (gptel-fsm-info fsm)
+            (plist-put info :end-time (current-time-string)))
+      (setf (buffer-local-value 'gptel--fsm-last
+                                (plist-get info :buffer))
+            fsm)))
+
+(defun gptel--fsm-inspect (&optional fsm)
+  "Inspect gptel request state FSM.
+
+FSM defaults to the state of the last request in the current
+buffer."
+  (unless fsm (setq fsm gptel--fsm-last))
+  (unless (cl-typep gptel--fsm-last 'gptel-fsm)
+    (user-error "No gptel request log in this buffer yet!"))
+  (require 'tabulated-list)
+  (with-current-buffer (get-buffer-create "*gptel-diagnostic*")
+    (setq tabulated-list-format [("Request attribute" 30 t) ("Value" 30)])
+    (let* ((pb (lambda (s) (propertize s 'face 'font-lock-builtin-face)))
+           (ps (lambda (s) (propertize s 'face 'font-lock-string-face)))
+           (inhibit-read-only t)
+           (info (gptel-fsm-info fsm))
+           (entries-info
+            (cl-loop
+             for idx upfrom 3
+             for (key val) on info by #'cddr
+             unless (memq key '(:parser :transformer :callback :data
+                                :token :stream))
+             collect
+             (list idx `[,(funcall pb (symbol-name key))
+                         ,(funcall ps (or (and (stringp val) val)
+                                       (prin1-to-string val)))])))
+           (entries-data
+            (cl-loop
+             for idx upfrom 50
+             for (key val) on (plist-get info :data) by #'cddr
+             unless (memq key '(:messages :contents :system
+                                :query :system_instruction))
+             collect
+             (list idx `[,(funcall pb (symbol-name key))
+                         ,(funcall ps (or (and (stringp val) val)
+                                       (prin1-to-string val)))]))))
+      (setq tabulated-list-entries
+            (nconc (list `(1 [,(funcall pb ":state")
+                              ,(funcall ps
+                                (symbol-name (gptel-fsm-state fsm)))]))
+                   entries-info
+                   entries-data))
+      (tabulated-list-print)
+      (tabulated-list-mode)
+      (tabulated-list-init-header)
+      (hl-line-mode 1)
+      (display-buffer
+       (current-buffer)
+       '((display-buffer-in-side-window)
+         (side . bottom)
+         (window-height . fit-window-to-buffer)
+         (slot . 10)
+         (body-function . select-window))))))
 
 ;;;; State machine handlers
 ;; The next few functions are default state handlers for gptel's state machine,
